@@ -34,7 +34,8 @@
 
 using json = nlohmann::ordered_json;
 
-constexpr int HTTP_POLLING_SECONDS = 1;
+constexpr int HTTP_POLLING_SECONDS         = 1;
+constexpr int HTTP_STREAM_HEARTBEAT_SECONDS = 5;
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -3557,37 +3558,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
     } else {
-        // in streaming mode, the first error must be treated as non-stream response
-        // this is to match the OAI API behavior
-        // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
-            return res; // connection is closed
-        }
-
-        if (first_result->is_error()) {
-            res->error(first_result->to_json());
-            return res;
-        }
-
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
-        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
-        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
-        } else {
-            res->data = format_oai_sse(first_result_json);
+        // Return immediately so HTTP response headers are sent to the client
+        // without blocking on the first inference result. This prevents clients
+        // from timing out while the server processes a long prompt.
+        //
+        // The ": keep-alive" SSE comment is sent as the first chunk (before
+        // rd.next() can block), keeping the connection alive on the client side.
+        // All results, including any errors, are delivered as SSE events below.
+        if (req.should_stop()) {
+            return res; // connection closed before streaming could start
         }
         res->status = 200;
         res->content_type = "text/event-stream";
+        res->data = ": keep-alive\n\n";
         res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
@@ -3607,7 +3590,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
 
                 if (!res_this->data.empty()) {
-                    // flush the first chunk
+                    // flush the initial keepalive comment before blocking on rd.next()
                     output = std::move(res_this->data);
                     res_this->data.clear();
                     return true;
@@ -3632,12 +3615,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     return false; // no more data, terminate
                 }
 
-                // receive subsequent results
-                auto result = rd.next(req.should_stop);
+                // Wait up to the heartbeat interval for the next result.
+                // If nothing arrives, send a keepalive SSE comment so the
+                // client knows the server is still alive.
+                auto result = rd.try_next(HTTP_STREAM_HEARTBEAT_SECONDS);
                 if (result == nullptr) {
-                    SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
-                    GGML_ASSERT(req.should_stop());
-                    return false; // should_stop condition met
+                    if (req.should_stop()) {
+                        SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                        return false;
+                    }
+                    // heartbeat: no result yet, keep the connection alive
+                    output = ": keep-alive\n\n";
+                    return true;
                 }
 
                 // send the results

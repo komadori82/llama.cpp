@@ -407,6 +407,29 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
     // should not reach here
 }
 
+// return nullptr if no result arrives within timeout_seconds (no should_stop check, no logging)
+// note: if one error is received, it will stop further processing and return error result
+server_task_result_ptr server_response_reader::try_next(int timeout_seconds) {
+    server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, timeout_seconds);
+    if (result == nullptr) {
+        return nullptr;
+    }
+    if (result->is_error()) {
+        stop(); // cancel remaining tasks
+        SRV_DBG("%s", "received error result, stopping further processing\n");
+        return result;
+    }
+    if (!states.empty()) {
+        const size_t idx = result->index;
+        GGML_ASSERT(idx < states.size());
+        result->update(states[idx]);
+    }
+    if (result->is_stop()) {
+        received_count++;
+    }
+    return result;
+}
+
 server_response_reader::batch_response server_response_reader::wait_for_all(const std::function<bool()> & should_stop) {
     batch_response batch_res;
     batch_res.results.clear();
